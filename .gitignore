@@ -1,0 +1,36 @@
+# Runtime / user data — never commit captures, reports, or local config
+W1CK3DWizard/
+**/W1CK3DWizard/
+*.pcap
+*.pcapng
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Editors / OS cruft
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Local secrets/config (API keys etc. should never be in the repo)
+config.json
+.env
