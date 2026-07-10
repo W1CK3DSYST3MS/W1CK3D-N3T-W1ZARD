@@ -10,7 +10,19 @@ An offline desktop app that turns a raw network capture into a plain-English sec
 
 ## Screenshots
 
-> _Add screenshots of the Overview, Device Inventory, and Security Findings views here._
+> Demo data — all IP addresses, MAC addresses, and hostnames are redacted.
+
+**Overview** — a plain-English summary of a capture: devices, findings, traffic split.
+
+![Overview](assets/screenshots/overview.png)
+
+**Protocol Library** — automatic protocol identification with a self-building library and one-click "Build library from this capture".
+
+![Protocol Library](assets/screenshots/protocols.png)
+
+**Security Findings** — issues flagged by severity, each with a plain-English explanation and what to do.
+
+![Security Findings](assets/screenshots/findings.png)
 
 ---
 
