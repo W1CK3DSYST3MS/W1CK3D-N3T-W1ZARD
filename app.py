@@ -59,10 +59,12 @@ from tools.protocol_library import (          # noqa: E402
     RISK_NONE, RISK_LOW, RISK_MEDIUM, RISK_HIGH,
 
     lookup_layer_hint, lookup_port_iana,
+    identify_protocol, learn_from_capture, promote_auto_entry,
 )
 from tools.scan_profiles import (             # noqa: E402
     SCAN_PROFILES, get_profiles_by_category,
     build_step_args, parse_nmap_output,
+    SCAN_OPTIONS, SCAN_TIMING, default_options,
 )
 from tools.wireless_analyzer import analyze_80211_pcap  # noqa: E402
 from admin_panel import AdminSettingsPanel               # noqa: E402
@@ -984,7 +986,7 @@ class ScanTaskWizard(tk.Toplevel):
     _ICLR  = {'pending': C['faint'], 'running': C['info'],
                'done': C['secure'],   'error':   C['critical']}
 
-    def __init__(self, parent, profile: dict, target: str):
+    def __init__(self, parent, profile: dict, target: str, options: dict = None):
         super().__init__(parent)
         self.title(f'Scan Task — {profile["label"]}')
         self.geometry('1080x720')
@@ -995,6 +997,7 @@ class ScanTaskWizard(tk.Toplevel):
         self._app              = parent
         self._profile          = profile
         self._target           = target
+        self._options          = options   # user-selected scan options (or None)
         self._steps            = profile['steps']
         self._context          = {'open_ports': '', 'hosts': []}
         self._status           = ['pending'] * len(self._steps)
@@ -1188,7 +1191,7 @@ class ScanTaskWizard(tk.Toplevel):
         self._header_var.set(step['label'])
         self._desc_var.set(step.get('description', ''))
 
-        args   = build_step_args(step, self._context)
+        args   = build_step_args(step, self._context, self._options)
         target = self._get_target(step)
         self._cmd_var.set('nmap ' + ' '.join(args) + ' ' + target)
 
@@ -1297,7 +1300,7 @@ class ScanTaskWizard(tk.Toplevel):
         self._analysis.insert('end', 'Analysis will appear here when the scan completes.\n', 'body')
         self._analysis.config(state='disabled')
 
-        args       = build_step_args(step, self._context)
+        args       = build_step_args(step, self._context, self._options)
         target     = self._get_target(step)
         cmd        = [NMAP_EXE] + args + [target]
         cmd_str    = 'nmap ' + ' '.join(args) + ' ' + target
@@ -1446,7 +1449,7 @@ class ScanTaskWizard(tk.Toplevel):
             w(f'  No changes were needed — Step {cur_idx + 2} will use the same '
               f'target and settings.\n', 'body')
 
-        next_args = build_step_args(next_step, self._context)
+        next_args = build_step_args(next_step, self._context, self._options)
         next_tgt  = self._get_target(next_step)
         w(f'\n  Command ready:  nmap {" ".join(next_args)} {next_tgt}\n', 'cmd')
         w('\n  Click the button below to run this step when you are ready.\n', 'indent')
@@ -1864,6 +1867,7 @@ class App(tk.Tk):
         self.current_results   = None
         self._new_macs         = set()    # MACs first-seen in the currently loaded report
         self._device_registry  = {}       # full registry dict, loaded on report open
+        self._learned_reports  = set()    # report ids whose protocols we've learned from
 
         self._build_menu()
         self._build_ui()
@@ -2088,7 +2092,7 @@ class App(tk.Tk):
         row = ttk.Frame(footer, style='Sidebar.TFrame')
         row.pack(fill='x', pady=(10, 0))
         self._build_secure_badge(row).pack(side='left')
-        ttk.Label(row, text='v3.1.3', style='SidebarBadge.TLabel').pack(side='right')
+        ttk.Label(row, text='v3.2.0', style='SidebarBadge.TLabel').pack(side='right')
 
     def _build_secure_badge(self, parent):
         chip = tk.Frame(parent, bg=C['surface'])
@@ -2304,10 +2308,16 @@ class App(tk.Tk):
 
         ttk.Button(toolbar, text='  Manage Protocol Library…  ',
                    command=self._show_protocol_library).pack(side='left')
+        ttk.Button(toolbar, text='  ⚙ Build library from this capture  ',
+                   command=self._build_library_now).pack(side='left', padx=(8, 0))
 
         self._proto_unknown_only = tk.BooleanVar(value=False)
         ttk.Checkbutton(toolbar, text='Show unknown only',
                         variable=self._proto_unknown_only,
+                        command=self._apply_proto_filter).pack(side='left', padx=(12, 0))
+        self._proto_group_ephemeral = tk.BooleanVar(value=True)
+        ttk.Checkbutton(toolbar, text='Group ephemeral ports',
+                        variable=self._proto_group_ephemeral,
                         command=self._apply_proto_filter).pack(side='left', padx=(12, 0))
 
         # ---- split pane: list top, description bottom ----
@@ -2396,6 +2406,9 @@ class App(tk.Tk):
                                     command=self._proto_add_to_library)
         self.proto_menu.add_command(label='Edit library entry…',
                                     command=self._proto_edit_entry)
+        self.proto_menu.add_separator()
+        self.proto_menu.add_command(label='Make permanent (promote auto entry)',
+                                    command=self._proto_promote)
         self.protocols_tv.bind('<Button-3>', self._show_proto_context)
         self.protocols_tv.bind('<Button-2>', self._show_proto_context)
 
@@ -2664,6 +2677,15 @@ class App(tk.Tk):
         from tools.device_registry import update_from_report, load_registry
         self._new_macs        = set(update_from_report(results))
         self._device_registry = load_registry()
+
+        # Auto-build the protocol library from this capture (once per report),
+        # BEFORE rendering so newly-identified protocols show up named.
+        if report_id not in self._learned_reports:
+            try:
+                learn_from_capture(results)
+            except Exception:
+                pass
+            self._learned_reports.add(report_id)
 
         self._render_summary(results, meta)
         self._render_devices(results)
@@ -3277,7 +3299,7 @@ class App(tk.Tk):
         """Open the scan profile picker dialog."""
         dlg = tk.Toplevel(self)
         dlg.title('Scan Profiles')
-        dlg.geometry('840x580')
+        dlg.geometry('880x740')
         dlg.resizable(True, True)
         dlg.transient(self)
         dlg.grab_set()
@@ -3344,6 +3366,52 @@ class App(tk.Tk):
         ttk.Label(tgt_row, textvariable=hint_var, foreground=C['faint'],
                   font=('TkDefaultFont', 8)).pack(side='left')
 
+        # ── Advanced options
+        opts_frame = ttk.LabelFrame(dlg, text='  Advanced options  ', padding=(10, 6))
+        opts_frame.pack(fill='x', padx=8, pady=(0, 4))
+
+        toggle_vars: dict = {}
+        for i, opt in enumerate(SCAN_OPTIONS):
+            var = tk.BooleanVar(value=opt['default'])
+            toggle_vars[opt['key']] = var
+            row = ttk.Frame(opts_frame)
+            row.grid(row=i, column=0, sticky='w', pady=1)
+            ttk.Checkbutton(row, text=opt['label'], variable=var).pack(side='left')
+            admin_tag = '  · needs admin' if opt.get('admin') else ''
+            ttk.Label(row, text=opt['help'] + admin_tag, foreground=C['faint'],
+                      font=('TkDefaultFont', 8), wraplength=470,
+                      justify='left').pack(side='left', padx=(8, 0))
+
+        # timing + custom flags row
+        extra_row = ttk.Frame(opts_frame)
+        extra_row.grid(row=len(SCAN_OPTIONS), column=0, sticky='w', pady=(6, 0))
+        ttk.Label(extra_row, text='Speed:').pack(side='left')
+        timing_var = tk.StringVar(value='-T4')
+        ttk.Combobox(extra_row, textvariable=timing_var, state='readonly', width=28,
+                     values=[lbl for _v, lbl in SCAN_TIMING]
+                     ).pack(side='left', padx=(6, 16))
+        # map the friendly timing labels back to their flags
+        timing_label_to_flag = {lbl: v for v, lbl in SCAN_TIMING}
+        # show the default label
+        for v, lbl in SCAN_TIMING:
+            if v == '-T4':
+                timing_var.set(lbl)
+        ttk.Label(extra_row, text='Custom flags:').pack(side='left')
+        custom_var = tk.StringVar()
+        ttk.Entry(extra_row, textvariable=custom_var, width=22,
+                  font=('Courier', 9)).pack(side='left', padx=(6, 0))
+        ttk.Label(opts_frame, text="Extra nmap flags for power users, space-separated "
+                  "(e.g. --reason -6). Applied on top of the profile.",
+                  foreground=C['faint'], font=('TkDefaultFont', 8)
+                  ).grid(row=len(SCAN_OPTIONS) + 1, column=0, sticky='w', pady=(2, 0))
+
+        def collect_options() -> dict:
+            opts = default_options()
+            opts['toggles'] = {k: v.get() for k, v in toggle_vars.items()}
+            opts['timing'] = timing_label_to_flag.get(timing_var.get(), '-T4')
+            opts['extra'] = [t for t in custom_var.get().split() if t]
+            return opts
+
         # ── Bottom buttons
         btn_row = ttk.Frame(dlg)
         btn_row.pack(fill='x', padx=8, pady=(0, 8))
@@ -3369,12 +3437,13 @@ class App(tk.Tk):
                     'Download from nmap.org and add it to PATH.',
                     parent=dlg)
                 return
+            options = collect_options()
             self._investigate_ip_var.set(target)
             dlg.destroy()
             if len(p['steps']) == 1:
-                self._run_profile_single(p, target)
+                self._run_profile_single(p, target, options)
             else:
-                ScanTaskWizard(self, p, target)
+                ScanTaskWizard(self, p, target, options)
 
         ttk.Button(btn_row, text='  Run Selected Scan  ',
                    command=run_scan).pack(side='left')
@@ -3407,10 +3476,10 @@ class App(tk.Tk):
 
         tv.bind('<<TreeviewSelect>>', on_select)
 
-    def _run_profile_single(self, profile: dict, target: str):
+    def _run_profile_single(self, profile: dict, target: str, options: dict = None):
         """Run a single-step scan profile inline in the investigate_text panel."""
         step       = profile['steps'][0]
-        args       = build_step_args(step, {})
+        args       = build_step_args(step, {}, options)
         cmd        = [NMAP_EXE] + args + [target]
         cmd_str    = 'nmap ' + ' '.join(args) + ' ' + target
         parse_mode = step.get('parse', 'ports')
@@ -3990,6 +4059,63 @@ class App(tk.Tk):
 
     # ======================================================= protocol tab render
 
+    def _build_library_now(self):
+        """Run the auto-identifier over the current capture and report what it learned."""
+        if not self.current_results:
+            messagebox.showinfo('No capture loaded',
+                                'Load or analyse a capture first, then build the library.',
+                                parent=self)
+            return
+        try:
+            summary = learn_from_capture(self.current_results)
+        except Exception as e:
+            messagebox.showerror('Build failed', str(e), parent=self)
+            return
+        if self.current_report_id:
+            self._learned_reports.add(self.current_report_id)
+        self._render_protocols(self.current_results)   # reflect newly-named protocols
+
+        new, upd = summary.get('new', []), summary.get('updated', [])
+        if new or upd:
+            parts = []
+            if new:
+                shown = '\n  • '.join(new[:15]) + ('\n  • …' if len(new) > 15 else '')
+                parts.append(f'Identified {len(new)} new protocol(s):\n  • {shown}')
+            if upd:
+                parts.append(f'Updated {len(upd)} existing entry(ies) with fresh counts.')
+            parts.append(
+                f'The library now holds {summary.get("total_auto", 0)} auto-identified '
+                'protocol(s), marked "⟳ auto". Right-click one to make it permanent.')
+            messagebox.showinfo('Protocol library built', '\n\n'.join(parts), parent=self)
+        else:
+            messagebox.showinfo(
+                'Protocol library built',
+                'Nothing new to learn — every protocol in this capture is already '
+                'in the library.', parent=self)
+
+    def _proto_promote(self):
+        """Promote the selected auto-identified entry into the permanent user library."""
+        sel = self.protocols_tv.selection()
+        if not sel:
+            return
+        row = next((r for r in self._proto_rows_all if r[0] == sel[0]), None)
+        if not row:
+            return
+        entry = row[3]
+        if not (isinstance(entry, dict) and entry.get('auto_generated')):
+            messagebox.showinfo(
+                'Not an auto entry',
+                'Only "⟳ auto" (machine-identified) protocols can be promoted. '
+                'Curated entries are already permanent; use "Add to Protocol '
+                'Library…" for unknown rows.', parent=self)
+            return
+        if promote_auto_entry(entry['name']):
+            self.status_var.set(f'Promoted "{entry["name"]}" to your permanent library.')
+            self._render_protocols(self.current_results)
+        else:
+            messagebox.showerror('Promote failed',
+                                 'Could not find that auto entry to promote.', parent=self)
+
     def _render_protocols(self, results):
         """Build the Protocols tab from analysis results and the protocol library."""
         self.protocols_tv.delete(*self.protocols_tv.get_children())
@@ -4116,23 +4242,96 @@ class App(tk.Tk):
             return (tier, _risk_rank.get(risk, 99), -count)
         rows.sort(key=_sort_key)
 
-        # Populate treeview
+        # Build the full row set (kept in full; filtering/grouping happens at populate)
         for i, (name, cat, count, risk, status, entry, src) in enumerate(rows):
             iid = str(i)
             risk_label = _RISK_LABEL.get(risk, '?') if risk else '?'
-            is_hint = isinstance(entry, dict) and entry.get('_hint')
+            is_auto = isinstance(entry, dict) and entry.get('auto_generated')
+            if is_auto:
+                status = '⟳ auto · ' + status          # machine-identified marker
             if risk:
                 tag = f'risk_{risk}'
-            elif is_hint:
+            elif isinstance(entry, dict) and entry.get('_hint'):
                 tag = 'hint'
             else:
                 tag = 'unknown'
+            self._proto_rows_all.append((iid, (name, cat, count, risk_label, status), tag, entry, src))
+
+        self._populate_proto_tree()
+
+    # Ephemeral / dynamic client-port floor. 32768 covers Linux/Android/BSD
+    # (49152 is Windows/IANA); we only ever group UNIDENTIFIED ports at/above it,
+    # so named services and any interesting unknowns below it stay visible.
+    _EPHEMERAL_MIN = 32768
+
+    @classmethod
+    def _is_ephemeral_row(cls, entry, src) -> bool:
+        """True for an unidentified high/ephemeral client port (see _EPHEMERAL_MIN).
+
+        These are the short-lived source ports the OS assigns to outbound
+        connections — they flood the list on live captures but are not services.
+        Anything actually identified (curated / catalogue / IANA-named / learned /
+        user) on a high port is kept.
+        """
+        if not src or ':' not in src:
+            return False
+        kind, _, val = src.partition(':')
+        if kind not in ('tcp', 'udp'):
+            return False
+        try:
+            port = int(val)
+        except ValueError:
+            return False
+        if port < cls._EPHEMERAL_MIN:
+            return False
+        if entry is None:
+            return True
+        if isinstance(entry, dict):
+            if entry.get('user_added') or entry.get('auto_generated'):
+                return False
+            # unregistered hint (no IANA name) = a bare ephemeral port
+            return bool(entry.get('_hint') and not entry.get('_iana_name'))
+        return False
+
+    def _populate_proto_tree(self):
+        """Fill the protocols tree from _proto_rows_all, applying search,
+        unknown-only, and ephemeral-port grouping."""
+        search = self._proto_search_var.get().lower()
+        unknown_only = self._proto_unknown_only.get()
+        # Group ephemeral ports unless the user is doing a specific text search
+        # (a search should be able to find an ephemeral port by number).
+        group_eph = self._proto_group_ephemeral.get() and not search
+
+        self.protocols_tv.delete(*self.protocols_tv.get_children())
+        self._ephemeral_ports = []
+        eph_packets = 0
+
+        for iid, vals, tag, entry, src in self._proto_rows_all:
+            name, cat, count, risk_label, status = vals
+            is_unknown = (entry is None
+                          or (isinstance(entry, dict) and entry.get('_hint')))
+            if unknown_only and not is_unknown:
+                continue
+            if search and (search not in name.lower() and search not in cat.lower()
+                           and search not in status.lower()):
+                continue
+            if group_eph and self._is_ephemeral_row(entry, src):
+                self._ephemeral_ports.append((name, count))
+                eph_packets += count
+                continue
             self.protocols_tv.insert('', 'end', iid=iid,
                                      values=(name, cat, f'{count:,}', risk_label, status),
                                      tags=(tag,))
-            self._proto_rows_all.append((iid, (name, cat, count, risk_label, status), tag, entry, src))
 
-        # Auto-select first row
+        if self._ephemeral_ports:
+            n = len(self._ephemeral_ports)
+            self.protocols_tv.insert(
+                '', 'end', iid='__eph__',
+                values=('⋯ Ephemeral / client ports', 'Ephemeral', f'{eph_packets:,}', '–',
+                        f'{n} short-lived high ports (32768+) with no service — normal '
+                        'client-side connection ports. Untick "Group ephemeral ports" to list them.'),
+                tags=('hint',))
+
         children = self.protocols_tv.get_children()
         if children:
             self.protocols_tv.selection_set(children[0])
@@ -4140,21 +4339,36 @@ class App(tk.Tk):
             self._show_proto_detail()
 
     def _apply_proto_filter(self):
-        """Re-filter the protocols treeview based on search text and unknown-only toggle."""
-        search = self._proto_search_var.get().lower()
-        unknown_only = self._proto_unknown_only.get()
+        """Re-filter/re-group the protocols treeview when a toggle or search changes."""
+        self._populate_proto_tree()
 
-        self.protocols_tv.delete(*self.protocols_tv.get_children())
-        for iid, vals, tag, entry, src in self._proto_rows_all:
-            name, cat, count, risk_label, status = vals
-            is_unknown = (entry is None)
-            if unknown_only and not is_unknown:
-                continue
-            if search and search not in name.lower() and search not in cat.lower() and search not in status.lower():
-                continue
-            self.protocols_tv.insert('', 'end', iid=iid,
-                                     values=(name, cat, count, risk_label, status),
-                                     tags=(tag,))
+    def _show_ephemeral_detail(self):
+        """Detail panel for the grouped 'ephemeral / client ports' summary row."""
+        t = self.proto_text
+        t.config(state='normal')
+        t.delete('1.0', 'end')
+        ports = getattr(self, '_ephemeral_ports', [])
+        t.insert('end', 'Ephemeral / client ports\n', 'name')
+        t.insert('end', f'{len(ports)} high ports grouped\n', 'label')
+        t.insert('end', '\nWhat this is\n', 'label')
+        t.insert('end',
+                 'When your device makes an outbound connection, the operating system gives '
+                 'it a temporary high-numbered "ephemeral" port (32768–65535) as the return '
+                 'address. Every connection gets a different one, so a live capture sees '
+                 'hundreds of them. They are not services — grouping them keeps the real '
+                 'protocols readable.\n', 'body')
+        t.insert('end', '\nWhen to look closer\n', 'label')
+        t.insert('end',
+                 'Only if a device you would not expect to be a server is listening on high '
+                 'ports, or the same high port keeps recurring. Untick "Group ephemeral '
+                 'ports" to list them all.\n', 'body')
+        if ports:
+            t.insert('end', '\nGrouped ports (busiest first)\n', 'label')
+            for name, count in sorted(ports, key=lambda x: -x[1])[:60]:
+                t.insert('end', f'  {name}   ({count:,} packets)\n', 'body')
+            if len(ports) > 60:
+                t.insert('end', f'  … and {len(ports) - 60} more\n', 'body')
+        t.config(state='disabled')
 
     def _show_proto_detail(self):
         """Populate the description panel for the selected protocol row."""
@@ -4162,6 +4376,9 @@ class App(tk.Tk):
         if not sel:
             return
         iid = sel[0]
+        if iid == '__eph__':
+            self._show_ephemeral_detail()
+            return
         row = next((r for r in self._proto_rows_all if r[0] == iid), None)
         if not row:
             return

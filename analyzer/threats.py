@@ -1,7 +1,37 @@
 import collections
 import ipaddress
 import math
+import socket
 from .base import Analyzer, Finding
+
+
+def get_local_ips():
+    """Best-effort set of this machine's own IPv4 addresses (all interfaces).
+
+    Used to recognise the computer running this tool, so that scans launched
+    from this machine (e.g. the built-in nmap scan tools) are not flagged as a
+    hostile port scan / network sweep. Never raises.
+    """
+    ips = {'127.0.0.1'}
+    try:
+        host = socket.gethostname()
+        try:
+            ips.update(socket.gethostbyname_ex(host)[2])
+        except Exception:
+            pass
+        # Primary outbound interface IP (UDP connect sends no packets).
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                s.connect(('8.8.8.8', 80))
+                ips.add(s.getsockname()[0])
+            finally:
+                s.close()
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return {ip for ip in ips if ip}
 
 
 def _shannon_entropy(s):
@@ -553,6 +583,8 @@ class ThreatAnalyzer(Analyzer):
     # ============================================================== finalize
     def finalize(self, context=None):
         device_a = context.get('devices_raw') if context else None
+        # This machine's own IPs — so scans WE launched aren't flagged as attacks.
+        local_ips = set((context or {}).get('local_ips') or []) or get_local_ips()
 
         def _mac_for_ip(ip):
             if not device_a:
@@ -603,6 +635,43 @@ class ThreatAnalyzer(Analyzer):
             if count < 50:
                 continue
             mac = _mac_for_ip(src_ip)
+
+            # Recognise this computer's own scans (e.g. you ran the built-in
+            # nmap tools, or captured your own machine). Report it as an
+            # informational note instead of a high-risk attack, so users aren't
+            # alarmed by their own activity.
+            if src_ip in local_ips and (unique_ports >= 20 or unique_hosts >= 20):
+                self._emit(Finding(
+                    severity='info',
+                    category='network',
+                    title='Scan traffic from this computer (your own device)',
+                    description=(
+                        'This computer — the one running W1CK3D NET WIZARD — sent '
+                        f'scan-like traffic ({unique_ports} port(s) across '
+                        f'{unique_hosts} host(s)). This is exactly what you would '
+                        'expect if you ran the built-in scan tools (or any scanner) '
+                        'from this machine. It is your own activity, not an outside '
+                        'attacker, so it is not a threat.'
+                    ),
+                    technical=(
+                        f'{src_ip} (this device) → {unique_ports} unique ports on '
+                        f'{unique_hosts} host(s), {count} total SYNs'
+                    ),
+                    device_mac=mac,
+                    recommendation=(
+                        'No action needed if you ran a scan yourself.\n'
+                        'If you did NOT run any scanning tool, a program on this '
+                        'computer may be scanning the network without your knowledge — '
+                        'review your running applications and run a full antivirus scan.'
+                    ),
+                    evidence={
+                        'src_ip': src_ip, 'total_syns': count,
+                        'unique_ports': unique_ports, 'unique_hosts': unique_hosts,
+                        'local_device': True,
+                    },
+                ))
+                continue
+
             if unique_ports >= 20:
                 self._emit(Finding(
                     severity='high',

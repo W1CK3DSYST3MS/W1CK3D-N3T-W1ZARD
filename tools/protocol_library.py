@@ -20,9 +20,20 @@ full entries.  They have: name, plain_english, category, risk, _hint.
 
 import json
 import socket
+from datetime import date
 from pathlib import Path
 
+try:
+    from tools.port_catalog import lookup as _catalog_lookup
+except Exception:  # pragma: no cover - fallback if run as a loose module
+    try:
+        from port_catalog import lookup as _catalog_lookup
+    except Exception:
+        _catalog_lookup = lambda *a, **k: None
+
 _USER_PATH = Path.home() / 'W1CK3DWizard' / 'protocol_library_user.json'
+# Machine-learned entries: the library builds itself here as captures are analysed.
+_AUTO_PATH = Path.home() / 'W1CK3DWizard' / 'protocol_library_auto.json'
 
 # ── risk levels ───────────────────────────────────────────────────────────────
 RISK_NONE   = 'none'
@@ -1604,19 +1615,23 @@ def _port_range_description(port: int) -> str:
 # ── public API ────────────────────────────────────────────────────────────────
 
 def load_library() -> list:
-    """Return built-in protocols merged with user-added entries.
-    User entries with the same name override built-ins.
+    """Return the merged protocol library.
+
+    Precedence (lowest → highest): built-in  <  auto-learned  <  user-added.
+    So a machine-learned entry enriches an unknown protocol, and anything the
+    user writes always wins.
     """
     lib = {e['name']: dict(e) for e in BUILTIN_PROTOCOLS}
-    try:
-        user_entries = json.loads(_USER_PATH.read_text(encoding='utf-8'))
-        for e in user_entries:
-            e['user_added'] = True
+    for e in _load_auto_entries():
+        e = dict(e)
+        e['auto_generated'] = True
+        # never let an auto entry mask a curated built-in of the same name
+        if e['name'] not in lib:
             lib[e['name']] = e
-    except FileNotFoundError:
-        pass
-    except Exception:
-        pass
+    for e in _load_user_entries():
+        e = dict(e)
+        e['user_added'] = True
+        lib[e['name']] = e
     return list(lib.values())
 
 
@@ -1742,3 +1757,210 @@ def risk_rank(risk: str) -> int:
         return _RISK_ORDER.index(risk)
     except ValueError:
         return 0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Automatic identification + self-building library
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _heuristic_port_info(port: int, transport: str) -> dict:
+    """Last-resort informative description from the port number alone."""
+    t = (transport or 'tcp').upper()
+    return {
+        'name': f'{t}/{port}',
+        'full_name': f'Unidentified service on port {port}/{t}',
+        'category': 'Unknown',
+        'risk': RISK_NONE,
+        'plain_english': (
+            f'Traffic on port {port}/{t} that could not be matched to a known '
+            f'protocol offline. {_port_range_description(port)} Use the Investigate '
+            f'tab on the IPs using it, or add a description to teach the library.'
+        ),
+        'confidence': 'low',
+        'source': 'heuristic',
+    }
+
+
+def identify_protocol(port: int = None, transport: str = None,
+                      layer_names=None, count: int = 0,
+                      library: list = None) -> dict:
+    """Best-effort identification of a protocol from any offline signal.
+
+    Combines, in order of reliability: curated library → decoded application
+    layer (what Wireshark actually saw) → bundled extended port catalogue →
+    OS/IANA service names → port-range heuristics. ALWAYS returns a dict with
+    name/category/risk/plain_english plus 'confidence' (high/medium/low) and
+    'source', so nothing is ever a dead-end "unknown".
+    """
+    if library is None:
+        library = load_library()
+    layer_names = [l.lower() for l in (layer_names or []) if l]
+
+    # 1) Decoded application layer — strongest signal (the packet really was this).
+    for ln in layer_names:
+        entry = lookup_layer(ln, library)
+        if entry:
+            r = dict(entry); r['confidence'] = 'high'; r['source'] = 'library'
+            return r
+    for ln in layer_names:
+        hint = lookup_layer_hint(ln)
+        if hint:
+            r = dict(hint); r.setdefault('full_name', r.get('name'))
+            r['layer_names'] = [ln]     # record so it re-matches next time
+            r['confidence'] = 'medium'; r['source'] = 'layer'; r.pop('_hint', None)
+            return r
+
+    # 2) Port against the curated library.
+    if port is not None:
+        for tp in ([transport] if transport else ['tcp', 'udp']):
+            entry = lookup_port(port, tp, library)
+            if entry:
+                r = dict(entry); r['confidence'] = 'high'; r['source'] = 'library'
+                return r
+        # 3) Bundled extended catalogue.
+        cat = _catalog_lookup(port, transport)
+        if cat:
+            r = dict(cat); r.setdefault('full_name', r.get('name'))
+            r['ports'] = [port]
+            r['transport'] = list(cat.get('transport') or ([transport] if transport else ['tcp']))
+            r['confidence'] = 'high'; r['source'] = 'catalog'
+            return r
+        # 4) OS / IANA service names.
+        for tp in ([transport] if transport else ['tcp', 'udp']):
+            iana = lookup_port_iana(port, tp)
+            if iana and iana.get('_iana_name'):
+                r = dict(iana); r.setdefault('full_name', r.get('name'))
+                r['confidence'] = 'medium'; r['source'] = 'iana'; r.pop('_hint', None)
+                return r
+        # 5) Heuristic — still informative.
+        return _heuristic_port_info(port, transport)
+
+    # Only an unrecognised layer name.
+    if layer_names:
+        return {
+            'name': layer_names[0].upper(), 'full_name': layer_names[0].upper(),
+            'category': 'Unknown', 'risk': RISK_NONE,
+            'plain_english': (
+                f'"{layer_names[0]}" was decoded by Wireshark but is not in the '
+                f'library yet. Add a description to teach the tool about it.'
+            ),
+            'confidence': 'low', 'source': 'layer',
+        }
+    return _heuristic_port_info(port or 0, transport)
+
+
+def _load_auto_entries() -> list:
+    try:
+        return json.loads(_AUTO_PATH.read_text(encoding='utf-8'))
+    except Exception:
+        return []
+
+
+def _save_auto_entries(entries: list):
+    _AUTO_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _AUTO_PATH.write_text(json.dumps(entries, indent=2, ensure_ascii=False),
+                          encoding='utf-8')
+
+
+def learn_from_capture(results: dict) -> dict:
+    """Grow the auto-learned library from one capture's protocol inventory.
+
+    Persists ONLY protocol-level facts (name, ports, category, risk, description,
+    seen counts, dates) to protocol_library_auto.json — never IPs or other
+    capture data. Returns {'new': [...], 'updated': [...], 'total_auto': n}.
+    """
+    proto = (results or {}).get('protocols') or {}
+    library = load_library()
+    curated = {e['name'] for e in library if not e.get('auto_generated')}
+    auto = {e['name']: dict(e) for e in _load_auto_entries()}
+    today = date.today().isoformat()
+    new_names, updated_names = [], []
+
+    def _observe(ident, count):
+        # Only learn things we could actually identify. 'low' confidence covers
+        # bare heuristic ports and undecoded/pseudo layer names (e.g. malformed
+        # frames) — we leave those as manual "unknown" rows rather than pollute
+        # the library with names we can't describe.
+        if ident.get('confidence') == 'low' or ident.get('source') == 'heuristic':
+            return
+        name = ident['name']
+        if name in curated:
+            return                      # already known — nothing to learn
+        rec = auto.get(name)
+        if rec is None:
+            auto[name] = {
+                'name': name, 'full_name': ident.get('full_name', name),
+                'ports': list(ident.get('ports', [])),
+                'transport': list(ident.get('transport', [])),
+                'layer_names': list(ident.get('layer_names', [])),
+                'category': ident.get('category', 'Unknown'),
+                'risk': ident.get('risk', RISK_NONE),
+                'plain_english': ident.get('plain_english', ''),
+                'expected_when': ident.get('expected_when', ''),
+                'unexpected_when': ident.get('unexpected_when', ''),
+                'action': ident.get('action',
+                                    'Review the devices using this; add notes if useful.'),
+                'auto_generated': True,
+                'confidence': ident.get('confidence', 'low'),
+                'source': ident.get('source', ''),
+                'times_seen': int(count), 'first_seen': today, 'last_seen': today,
+            }
+            new_names.append(name)
+        else:
+            rec['times_seen'] = int(rec.get('times_seen', 0)) + int(count)
+            rec['last_seen'] = today
+            for p in ident.get('ports', []):
+                rec.setdefault('ports', [])
+                if p not in rec['ports']:
+                    rec['ports'].append(p)
+            updated_names.append(name)
+
+    # Best signal: ports named by the layer decoded on them.
+    handled = set()
+    for key, layers in (proto.get('port_layers') or {}).items():
+        try:
+            tp, ps = key.split(':'); port = int(ps)
+        except Exception:
+            continue
+        handled.add((tp, port))
+        top = sorted(layers.items(), key=lambda x: -x[1]) if isinstance(layers, dict) else []
+        total = sum(c for _l, c in top)
+        _observe(identify_protocol(port=port, transport=tp,
+                                   layer_names=[l for l, _ in top],
+                                   count=total, library=library), total or 1)
+
+    # Bare ports with no decoded layer.
+    for tp, portmap in (('tcp', proto.get('tcp_ports') or {}),
+                        ('udp', proto.get('udp_ports') or {})):
+        for ps, count in portmap.items():
+            try:
+                port = int(ps)
+            except Exception:
+                continue
+            if (tp, port) in handled:
+                continue
+            _observe(identify_protocol(port=port, transport=tp, count=count,
+                                       library=library), count)
+
+    # Standalone decoded layers.
+    for ln, count in (proto.get('layers') or {}).items():
+        _observe(identify_protocol(layer_names=[ln], count=count, library=library), count)
+
+    if new_names or updated_names:
+        _save_auto_entries(list(auto.values()))
+    return {'new': sorted(set(new_names)), 'updated': sorted(set(updated_names)),
+            'total_auto': len(auto)}
+
+
+def promote_auto_entry(name: str) -> bool:
+    """Copy an auto-learned entry into the user library (permanent + editable)."""
+    for e in _load_auto_entries():
+        if e.get('name') == name:
+            e = dict(e)
+            for k in ('auto_generated', 'confidence', 'source',
+                      'times_seen', 'first_seen', 'last_seen'):
+                e.pop(k, None)
+            e['user_added'] = True
+            save_user_entry(e)
+            return True
+    return False

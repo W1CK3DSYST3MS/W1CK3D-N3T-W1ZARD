@@ -4,7 +4,7 @@
 
 An offline desktop app that turns a raw network capture into a plain-English security report — what's on your network, what it's talking to, and what looks wrong.
 
-`v3.1.3` · Windows · Linux · macOS (untested, run from source)
+`v3.2.0` · Windows · Linux · macOS (untested, run from source)
 
 ---
 

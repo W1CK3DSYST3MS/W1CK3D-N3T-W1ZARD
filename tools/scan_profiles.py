@@ -428,13 +428,18 @@ def get_profiles_by_category() -> dict:
     return result
 
 
-def build_step_args(step: dict, context: dict) -> list:
+def build_step_args(step: dict, context: dict, options: dict = None) -> list:
     """
-    Return the nmap arg list for a step, substituting runtime values.
+    Return the nmap arg list for a step, substituting runtime values and
+    merging any user-selected scan options.
 
     context keys:
         open_ports  – comma-joined port list from previous steps
         hosts       – list of host IPs discovered in previous steps
+
+    options (optional) – dict from default_options(): user toggles, timing,
+        and custom flags. When None, sensible defaults apply (notably -Pn on
+        port scans so firewalled hosts aren't falsely reported "down").
     """
     args = []
     for a in step['args']:
@@ -442,6 +447,106 @@ def build_step_args(step: dict, context: dict) -> list:
             ports = context.get('open_ports', '')
             a = a.replace('{open_ports}', ports if ports else '1-1000')
         args.append(a)
+
+    is_discovery = '-sn' in args
+
+    if options is None:
+        # Default behaviour (no user customisation): skip nmap's host-discovery
+        # ping on port scans by adding -Pn. Many devices — home routers,
+        # firewalled hosts, most Windows machines — don't answer nmap's default
+        # ping probes, so without -Pn nmap decides the host is "down" and skips
+        # the scan entirely: a fast, confusing false negative. We never add it to
+        # pure discovery sweeps (-sn), where finding live hosts is the point.
+        if not is_discovery and '-Pn' not in args:
+            args.insert(0, '-Pn')
+        return args
+
+    return _apply_options(args, is_discovery, options)
+
+
+# ─────────────────────────────── scan options ────────────────────────────────
+# Data-driven advanced options the UI exposes as checkboxes. Adding an option
+# here makes it appear in the Scan Profiles dialog automatically.
+#   key    – stable identifier used in the options dict
+#   label  – plain-English checkbox label
+#   flags  – nmap flags this option adds
+#   default– checked by default
+#   admin  – True if it needs administrator/root (raw sockets) to work
+#   help   – one-line explanation shown under the checkbox
+SCAN_OPTIONS = [
+    {'key': 'Pn', 'label': 'Skip host discovery  (-Pn)', 'flags': ['-Pn'],
+     'default': True, 'admin': False,
+     'help': "Scan even if the host doesn't answer a ping. Fixes the common "
+             "'host seems down' false negative on routers and firewalled devices."},
+    {'key': 'sV', 'label': 'Detect service versions  (-sV)', 'flags': ['-sV'],
+     'default': False, 'admin': False,
+     'help': 'Identify the exact software and version on each open port.'},
+    {'key': 'O', 'label': 'Detect operating system  (-O)', 'flags': ['-O'],
+     'default': False, 'admin': True,
+     'help': 'Guess the target OS. Needs administrator/root (raw sockets).'},
+    {'key': 'open', 'label': 'Show only open ports  (--open)', 'flags': ['--open'],
+     'default': False, 'admin': False,
+     'help': 'Hide closed and filtered ports from the results.'},
+    {'key': 'vuln', 'label': 'Check known vulnerabilities  (--script vuln)',
+     'flags': ['--script', 'vuln'], 'default': False, 'admin': False,
+     'help': "Run nmap's vulnerability-detection scripts. Slower and noisier."},
+]
+
+# Timing template dropdown (slower/quieter → faster/noisier). Default -T4.
+SCAN_TIMING = [
+    ('-T2', 'Polite (T2) — slower, quieter'),
+    ('-T3', 'Normal (T3)'),
+    ('-T4', 'Fast (T4) — default'),
+    ('-T5', 'Insane (T5) — fastest, noisiest'),
+]
+
+_TIMING_RE = re.compile(r'^-T[0-5]$')
+
+
+def default_options() -> dict:
+    """The starting options dict (defaults from SCAN_OPTIONS + -T4)."""
+    return {
+        'toggles': {o['key']: o['default'] for o in SCAN_OPTIONS},
+        'timing':  '-T4',
+        'extra':   [],   # custom nmap flags (list of tokens)
+    }
+
+
+def _apply_options(args: list, is_discovery: bool, options: dict) -> list:
+    """Merge user-selected options into a step's base args.
+
+    Port-scan toggles (-Pn/-sV/-O/--open/vuln) are skipped for -sn discovery
+    sweeps, where they'd be meaningless; timing and custom flags always apply.
+    Everything is de-duplicated so a profile that already includes a flag never
+    gets it twice.
+    """
+    args = list(args)
+    toggles = options.get('toggles', {})
+    flag_map = {o['key']: o['flags'] for o in SCAN_OPTIONS}
+
+    if not is_discovery:
+        for key, flags in flag_map.items():
+            if not toggles.get(key):
+                continue
+            # skip if any of this option's flags are already present
+            if any(f in args for f in flags):
+                continue
+            if key == 'Pn':
+                args = flags + args      # -Pn reads best at the front
+            else:
+                args += flags
+
+    # Timing override: replace any existing -T* with the chosen template.
+    timing = options.get('timing')
+    if timing:
+        args = [a for a in args if not _TIMING_RE.match(a)]
+        args.append(timing)
+
+    # Custom flags (power users) — appended verbatim, de-duplicated.
+    for tok in options.get('extra', []):
+        if tok and tok not in args:
+            args.append(tok)
+
     return args
 
 

@@ -1,0 +1,27 @@
+# Normalize line endings so cross-platform scripts always work.
+* text=auto
+
+# Unix shell installers/launchers MUST stay LF or they won't run on Linux/macOS.
+*.sh        text eol=lf
+*.command   text eol=lf
+
+# Windows scripts stay CRLF.
+*.bat       text eol=crlf
+*.ps1       text eol=crlf
+
+# Python and docs: LF everywhere (works on all platforms).
+*.py        text eol=lf
+*.pyw       text eol=lf
+*.md        text eol=lf
+*.txt       text eol=lf
+
+# Binary assets — never touch.
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.icns  binary
+*.ttf   binary
+*.otf   binary
+*.zip   binary

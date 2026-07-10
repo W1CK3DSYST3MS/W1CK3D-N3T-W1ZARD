@@ -159,7 +159,10 @@ def run_analysis(pcap_path):
     print(f"Finished reading {total:,} packets. Running post-processing...")
 
     # Finalize — devices first so network/threat analyzers can use its output.
-    context = {'devices_raw': device_a}
+    # local_ips lets the threat analyzer recognise scans launched from THIS
+    # machine (e.g. the built-in nmap tools) and not flag them as attacks.
+    from analyzer.threats import get_local_ips
+    context = {'devices_raw': device_a, 'local_ips': get_local_ips()}
     for a in analyzers:
         a.finalize(context=context)
 

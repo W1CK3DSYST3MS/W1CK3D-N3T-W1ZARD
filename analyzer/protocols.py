@@ -9,7 +9,22 @@ _SKIP_LAYERS = frozenset({
     'wlan_radio', 'ppi', 'geninfo', 'wireshark_json', 'expert', 'malformed',
     'json', 'mime_multipart', 'media', 'pkix1explicit', 'pkix1implicit',
     'x509af', 'x509ce', 'x509if', 'x509sat',
+    # additional framing / infrastructure / data-format noise
+    'vlan', 'llc', 'sll', 'null', 'loop', 'xml', 'vssmonitoring',
+    'fake-field-wrapper', 'tcp.segments', 'ip.fragments', 'short',
 })
+
+
+def _is_noise_layer(name: str) -> bool:
+    """True for framing/pseudo layers that aren't real application protocols.
+
+    Filters Wireshark internal pseudo-layers (``_ws.malformed``, ``_ws.expert``
+    …) and anything in _SKIP_LAYERS, so the protocol inventory and the auto-learn
+    step only ever see genuine application protocols.
+    """
+    n = name.lower()
+    return (n in _SKIP_LAYERS or n.startswith('_ws.') or n.startswith('_')
+            or 'malformed' in n or 'expert' in n or 'segment' in n)
 
 
 class ProtocolAnalyzer(Analyzer):
@@ -27,26 +42,39 @@ class ProtocolAnalyzer(Analyzer):
         self._tcp_ports = collections.Counter()   # dst port -> packet count
         self._udp_ports = collections.Counter()   # dst port -> packet count
         self._layers    = collections.Counter()   # layer name -> packet count
+        # "tcp:443" -> Counter({'tls': 900}) — which decoded protocol rides on
+        # each port, so a port can be named by what Wireshark actually saw.
+        self._port_layers = collections.defaultdict(collections.Counter)
 
     def process_packet(self, pkt):
         # Track all named application layers (exclude base infrastructure)
+        app_layers = []
         try:
             for layer in pkt.layers:
                 lname = layer.layer_name.lower()
-                if lname not in _SKIP_LAYERS:
+                if not _is_noise_layer(lname):
                     self._layers[lname] += 1
+                    app_layers.append(lname)
         except Exception:
             pass
 
-        # Track destination ports — these fill in for protocols with no named layer
+        # Track destination port + transport (fills in for unnamed protocols).
+        port = tp = None
         try:
-            self._tcp_ports[int(pkt.tcp.dstport)] += 1
+            port = int(pkt.tcp.dstport); tp = 'tcp'
+            self._tcp_ports[port] += 1
         except Exception:
             pass
-        try:
-            self._udp_ports[int(pkt.udp.dstport)] += 1
-        except Exception:
-            pass
+        if port is None:
+            try:
+                port = int(pkt.udp.dstport); tp = 'udp'
+                self._udp_ports[port] += 1
+            except Exception:
+                pass
+
+        # Correlate the most-specific decoded layer with the destination port.
+        if port is not None and app_layers:
+            self._port_layers[f'{tp}:{port}'][app_layers[-1]] += 1
 
     def finalize(self, context=None):
         pass
@@ -56,4 +84,5 @@ class ProtocolAnalyzer(Analyzer):
             'layers':    dict(self._layers),
             'tcp_ports': {str(p): c for p, c in self._tcp_ports.items()},
             'udp_ports': {str(p): c for p, c in self._udp_ports.items()},
+            'port_layers': {k: dict(v) for k, v in self._port_layers.items()},
         }
