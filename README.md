@@ -14,6 +14,21 @@ An offline desktop app that turns a raw network capture into a plain-English sec
 
 ---
 
+## What's new in v3.2.0
+
+The first feature release since the initial `v3.1.3`.
+
+- **Automatic protocol identification** — unknown protocols are now named offline by combining what Wireshark decoded on each port, a bundled port catalogue, IANA/OS service names, and port-range heuristics. No more dead-end "unknown" rows.
+- **Self-building protocol library** — confident identifications are learned and remembered (protocol-level facts only, never IPs) and can be promoted to permanent, editable entries. A **Build library from this capture** action shows what it learned.
+- **Ephemeral / client-port grouping** — on live captures the hundreds of short-lived high ports collapse into one summary row (toggle-able) so the real services stay readable.
+- **Guided-scan Advanced Options** — customise any scan: skip host discovery (`-Pn`), version detection (`-sV`), OS detection (`-O`), only-open ports, vulnerability scripts, a timing template, and custom flags.
+- **Scan fix — no more false "host down"** — port scans use `-Pn` by default, so firewalled hosts and home routers (which ignore nmap's ping) are actually scanned instead of wrongly reported offline.
+- **Own-scan recognition** — the analyzer now knows when scan traffic comes from *this* computer, so running the built-in tools shows a calm informational note instead of a high-risk "Port Scan Detected" alert.
+
+_Downloads are on the [v3.2.0 release](../../releases/tag/v3.2.0). Full history in the [releases list](../../releases)._
+
+---
+
 ## What it is
 
 W1CK3D NET WIZARD points at a packet capture (a `.pcap` / `.pcapng` file from Wireshark/tshark) — or runs a live capture — and produces a guided, readable security report. It's built for people who are **not** packet-analysis experts: every finding is explained in words, with why it matters and what to do about it.
